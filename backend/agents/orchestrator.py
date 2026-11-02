@@ -1,9 +1,8 @@
 import ollama  # Connects Python to your local Ollama AI models
-from typing import Optional
-# Import the strict JSON templates we created on Day 1
+from typing import Optional, Dict, Any
 from backend.schemas import PlannerOutput, CoderStep, ReviewerVerdict, SubTask
+from backend.systems.worktree import WorktreeManager
 
-# Model names: 3B for planning/coding, tiny 1.5B for fast code review
 PRIMARY_MODEL = "qwen2.5-coder:3b"
 REVIEWER_MODEL = "qwen2.5-coder:1.5b"
 
@@ -11,6 +10,7 @@ class AgentOrchestrator:
     def __init__(self, primary_model: str = PRIMARY_MODEL, reviewer_model: str = REVIEWER_MODEL):
         self.primary_model = primary_model
         self.reviewer_model = reviewer_model
+        self.worktree_mgr = WorktreeManager()
 
     def run_planner(self, user_prompt: str, repo_skeleton: str = "") -> PlannerOutput:
         """1. PLANNER AGENT: Breaks a user's feature request into smaller coding subtasks."""
@@ -23,7 +23,6 @@ class AgentOrchestrator:
         )
         user_message = f"Repository AST Skeleton:\n{repo_skeleton}\n\nFeature Request:\n{user_prompt}"
 
-        # Send prompt to Ollama and force it to reply using the PlannerOutput JSON format
         response = ollama.chat(
             model=self.primary_model,
             messages=[
@@ -31,9 +30,8 @@ class AgentOrchestrator:
                 {"role": "user", "content": user_message}
             ],
             format=PlannerOutput.model_json_schema(),
-            options={"temperature": 0.1}  # Low temperature (0.1) keeps the AI focused and accurate
+            options={"temperature": 0.1}
         )
-        # Convert the AI's JSON text into a validated Python object
         return PlannerOutput.model_validate_json(response["message"]["content"])
 
     def run_coder(
@@ -52,23 +50,19 @@ class AgentOrchestrator:
             "Respond ONLY with valid JSON matching the requested schema."
         )
 
-        # Build the task instructions for the Coder AI
         prompt_parts = [
             f"Task ID: {subtask.task_id}",
             f"Target File: {subtask.target_file}",
             f"Task Description: {subtask.description}",
             f"Attempt Step Number: {step_number}"
         ]
-        # If the file already exists, show the current code to the AI
         if existing_code:
             prompt_parts.append(f"Current File Content:\n{existing_code}")
-        # If a previous test failed, pass the error log so the AI can fix its own bug
         if error_traceback:
             prompt_parts.append(
                 f"Previous pytest execution failed with this traceback. Fix the bug:\n{error_traceback}"
             )
 
-        # Force Ollama to reply with both the explanation log and the new code
         response = ollama.chat(
             model=self.primary_model,
             messages=[
@@ -89,7 +83,6 @@ class AgentOrchestrator:
             "('LOW', 'MEDIUM', or 'HIGH'), and brief review notes."
         )
 
-        # Send the git diff to the fast 1.5B Reviewer model
         response = ollama.chat(
             model=self.reviewer_model,
             messages=[
@@ -101,23 +94,127 @@ class AgentOrchestrator:
         )
         return ReviewerVerdict.model_validate_json(response["message"]["content"])
 
+    def execute_subtask_pipeline(
+        self,
+        subtask: SubTask,
+        test_file_path: Optional[str] = None,
+        test_code_content: Optional[str] = None,
+        max_retries: int = 3
+    ) -> Dict[str, Any]:
+        """
+        DAY 3 PIPELINE:
+        1. Creates an isolated Git worktree for the subtask.
+        2. Runs the Coder Agent + pytest in a 3-retry self-healing loop.
+        3. Extracts the git diff and runs the 1.5B Reviewer Agent audit.
+        """
+        # 1. Create isolated Git worktree folder (worktrees/<task_id>)
+        wt_path = self.worktree_mgr.create_worktree(subtask.task_id)
 
-# Quick test block that runs when you execute: python3 -m backend.agents.orchestrator
+        # Optional: Write a unit test file inside the worktree to verify the AI's code
+        if test_file_path and test_code_content:
+            self.worktree_mgr.write_code(subtask.task_id, test_file_path, test_code_content)
+
+        current_code = ""
+        last_error = None
+        thought_history = []
+        tests_passed = False
+
+        # 2. 3-Retry Self-Healing Coding & Testing Loop
+        for attempt in range(1, max_retries + 1):
+            print(f"[{subtask.task_id}] Coding Attempt {attempt}/{max_retries}...")
+            coder_step = self.run_coder(
+                subtask=subtask,
+                step_number=attempt,
+                existing_code=current_code,
+                error_traceback=last_error
+            )
+            thought_history.append(coder_step.explainability_log.model_dump())
+
+            # Write the AI's generated code into the isolated worktree
+            self.worktree_mgr.write_code(
+                task_id=subtask.task_id,
+                relative_file_path=subtask.target_file,
+                content=coder_step.code_content
+            )
+            current_code = coder_step.code_content
+
+            # Run pytest inside the isolated worktree
+            passed, test_output = self.worktree_mgr.run_tests(subtask.task_id)
+            if passed:
+                print(f"[{subtask.task_id}] Pytest PASSED on Attempt {attempt}!")
+                tests_passed = True
+                break
+            else:
+                print(f"[{subtask.task_id}] Pytest FAILED on Attempt {attempt}. Feeding traceback to Coder...")
+                last_error = test_output
+
+        # 3. Extract Git Diff & Run Reviewer Agent Audit
+        git_diff = self.worktree_mgr.get_diff(subtask.task_id)
+
+        if tests_passed:
+            review_verdict = self.run_reviewer(git_diff)
+            final_status = "Ready to Merge" if review_verdict.passed else "Review"
+        else:
+            review_verdict = ReviewerVerdict(
+                passed=False,
+                risk_score="HIGH",
+                notes=f"Failed unit tests after {max_retries} self-healing attempts."
+            )
+            final_status = "Needs Human Help"
+
+        return {
+            "task_id": subtask.task_id,
+            "status": final_status,
+            "worktree_path": str(wt_path),
+            "attempts_used": len(thought_history),
+            "thought_logs": thought_history,
+            "git_diff": git_diff,
+            "reviewer_verdict": review_verdict.model_dump()
+        }
+
+
 if __name__ == "__main__":
-    print("Testing DevSwarm Local — Day 2 Orchestrator & Worktree Prototype...\n")
+    print("=== Testing DevSwarm Local — Day 3 End-to-End Self-Healing Pipeline ===\n")
     orchestrator = AgentOrchestrator()
 
-    # Step 1: Test the Planner Agent with a sample request
-    plan = orchestrator.run_planner(
-        user_prompt="Create a Python utility file backend/utils/math_ops.py with an add(a, b) function.",
-        repo_skeleton="backend/\n  schemas.py\n  main.py"
+    # Create a sample subtask
+    demo_subtask = SubTask(
+        task_id="task-day3-demo",
+        role="BACKEND_DATA",
+        description=(
+            "Create a Python file backend/utils/calculator.py with two functions: "
+            "add(a, b) that returns a + b, and multiply(a, b) that returns a * b."
+        ),
+        target_file="backend/utils/calculator.py"
     )
-    print("=== 1. PLANNER OUTPUT (Validated Pydantic JSON) ===")
-    print(plan.model_dump_json(indent=2))
 
-    # Step 2: Test the Coder Agent on the first task generated by the Planner
-    if plan.subtasks:
-        first_task = plan.subtasks[0]
-        coder_step = orchestrator.run_coder(subtask=first_task, step_number=1)
-        print("\n=== 2. CODER & TERMINAL OF THOUGHT OUTPUT ===")
-        print(coder_step.model_dump_json(indent=2))
+    # Create a real pytest file to verify the AI's code inside the isolated worktree
+    sample_pytest = (
+        "from backend.utils.calculator import add, multiply\n\n"
+        "def test_add():\n"
+        "    assert add(3, 5) == 8\n\n"
+        "def test_multiply():\n"
+        "    assert multiply(4, 3) == 12\n"
+    )
+
+    result = orchestrator.execute_subtask_pipeline(
+        subtask=demo_subtask,
+        test_file_path="tests/test_calculator.py",
+        test_code_content=sample_pytest
+    )
+
+    print(f"\nFinal Kanban Status: {result['status']}")
+    print(f"Attempts Used: {result['attempts_used']}")
+    print("\n--- Terminal of Thought Log ---")
+    for log in result["thought_logs"]:
+        print(f"Step {log['step_number']}: {log['human_explanation']}")
+        print(f"Why: {log['why_this_decision']}\n")
+
+    print("--- Extracted Git Diff ---")
+    print(result["git_diff"])
+
+    print("--- 1.5B Reviewer Verdict ---")
+    print(result["reviewer_verdict"])
+
+    # Clean up the demo worktree so the repo stays tidy
+    orchestrator.worktree_mgr.cleanup_worktree(demo_subtask.task_id)
