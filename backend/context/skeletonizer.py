@@ -1,9 +1,10 @@
 """
-skeletonizer.py  –  Day 2 + Day 3.
+skeletonizer.py  –  Day 2 + Day 3 + Day 6.
 
 Day 2: skeleton_node() and skeleton_of_file() produce a compact skeleton of ONE file.
 Day 3: skeleton_of_folder(), estimate_tokens(), and compression_stats() extend this
        to an entire folder and report how many tokens the skeleton saves.
+Day 6: get_repo_summary() wraps both into a single dict for the orchestrator.
 
 A skeleton keeps only class/function signatures and their first docstring line,
 dropping every implementation body.  This lets an LLM understand a codebase's
@@ -262,7 +263,73 @@ def compression_stats(folder):
 
 
 # ---------------------------------------------------------------------------
-# SECTION 7  –  __main__ block  (Day 2 updated for Day 3)
+# SECTION 7  –  get_repo_summary  (Day 6)
+# ---------------------------------------------------------------------------
+
+def get_repo_summary(repo_path):
+    """Return a single dict summarising the skeleton and token stats for a repo.
+
+    This is the main entry point for the orchestrator agent.  Instead of
+    calling skeleton_of_folder() and compression_stats() separately (which
+    would scan the filesystem twice), get_repo_summary() calls them once each
+    and merges the results into one dict.
+
+    Parameters
+    ----------
+    repo_path : str or Path
+        Root folder of the repository (or any sub-folder) to summarise.
+
+    Returns
+    -------
+    dict with keys:
+        summary        – the full skeleton text (str) produced by skeleton_of_folder()
+        files_scanned  – number of .py files processed (int)
+        tokens_before  – estimated tokens in the raw source files (int)
+        tokens_after   – estimated tokens in the skeleton text (int)
+        tokens_saved   – tokens_before minus tokens_after (int)
+        percent_saved  – percentage of tokens saved, rounded to 1 d.p. (float)
+
+    Raises
+    ------
+    FileNotFoundError
+        If repo_path does not exist or is not a directory.
+    """
+
+    # Convert to a Path object so we can use .exists() and .is_dir().
+    repo_path = Path(repo_path)
+
+    # Validate early: give a clear message rather than letting rglob crash
+    # with a confusing OS error deep inside skeleton_of_folder().
+    if not repo_path.exists():
+        raise FileNotFoundError(
+            f"get_repo_summary: path does not exist: {repo_path}"
+        )
+    if not repo_path.is_dir():
+        raise FileNotFoundError(
+            f"get_repo_summary: path is not a folder: {repo_path}"
+        )
+
+    # Reuse skeleton_of_folder() – do NOT duplicate its scanning logic here.
+    summary_text = skeleton_of_folder(repo_path)
+
+    # Reuse compression_stats() – do NOT duplicate its token-counting logic.
+    stats = compression_stats(repo_path)
+
+    # Merge the skeleton text and the stats into one dict for the orchestrator.
+    # The orchestrator can then pass summary directly to the LLM and use the
+    # numeric fields for logging / telemetry without any further processing.
+    return {
+        "summary":       summary_text,
+        "files_scanned": stats["files_scanned"],
+        "tokens_before": stats["tokens_before"],
+        "tokens_after":  stats["tokens_after"],
+        "tokens_saved":  stats["tokens_saved"],
+        "percent_saved": stats["percent_saved"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# SECTION 8  –  __main__ block  (Day 2 updated for Day 3)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":

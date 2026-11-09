@@ -1,5 +1,5 @@
 """
-test_context.py  –  Days 5 + schema-update: tests for skeletonizer.py and ast_db.py.
+test_context.py  –  Days 5 + schema-update + Day 6: tests for skeletonizer.py and ast_db.py.
 
 Runs under pytest OR plain python3.15 (a minimal runner is at the bottom).
 Every test uses a temporary database file so no devswarm.db is left behind.
@@ -24,7 +24,10 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent))
 
-from skeletonizer import skeleton_of_file, skeleton_of_folder, estimate_tokens, compression_stats
+from skeletonizer import (
+    skeleton_of_file, skeleton_of_folder, estimate_tokens,
+    compression_stats, get_repo_summary,
+)
 from ast_db import init_db, get_connection
 
 # Absolute path to the sample file sitting next to this test file.
@@ -401,6 +404,69 @@ def test_risk_score_check_constraint():
         assert row2[0] is None, f"risk_score should be NULL, got {row2[0]}"
     finally:
         _remove_db(db_path)
+
+
+# ===========================================================================
+# TESTS j-m  –  get_repo_summary  (Day 6)
+# ===========================================================================
+
+def test_get_repo_summary_returns_all_six_keys():
+    """get_repo_summary on a temp folder with one .py file returns all six keys."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        # Create a minimal .py file so the folder is not completely empty.
+        (tmp / "hello.py").write_text("def hi(): pass\n", encoding="utf-8")
+
+        result = get_repo_summary(tmp)
+
+        # Check that every required key is present in the returned dict.
+        expected_keys = {
+            "summary", "files_scanned",
+            "tokens_before", "tokens_after",
+            "tokens_saved", "percent_saved",
+        }
+        assert set(result.keys()) == expected_keys, (
+            f"Missing or extra keys: {set(result.keys())}"
+        )
+
+
+def test_get_repo_summary_missing_path_raises():
+    """get_repo_summary must raise FileNotFoundError for a non-existent path."""
+    raised = False
+    try:
+        # Use a path that certainly does not exist.
+        get_repo_summary("/this/path/does/not/exist/at/all")
+    except FileNotFoundError:
+        # This is exactly what we expect.
+        raised = True
+
+    assert raised, "Expected FileNotFoundError was not raised for a missing path."
+
+
+def test_get_repo_summary_tokens_after_less_than_before():
+    """On the real backend folder, tokens_after < tokens_before and saved = before - after."""
+    result = get_repo_summary(BACKEND)
+
+    assert result["tokens_after"] < result["tokens_before"], (
+        "Skeleton should be smaller than the original source."
+    )
+    # Verify the arithmetic is consistent – saved must equal before minus after.
+    assert result["tokens_saved"] == result["tokens_before"] - result["tokens_after"], (
+        "tokens_saved must equal tokens_before - tokens_after."
+    )
+
+
+def test_get_repo_summary_contains_class_calculator():
+    """The summary for the context folder must mention 'class Calculator'."""
+    # We scan only the context folder (which contains sample_for_testing.py)
+    # so the test does not depend on other teammates' files.
+    context_folder = Path(__file__).parent
+    result = get_repo_summary(context_folder)
+
+    assert "class Calculator" in result["summary"], (
+        "Expected 'class Calculator' in summary – is sample_for_testing.py present?"
+    )
 
 
 # ===========================================================================
